@@ -1,0 +1,25 @@
+#!/bin/bash
+# Obsidian Browser - Lancement automatique avec Tor
+
+cd "$(dirname "$0")"
+
+echo "🦉 Obsidian Browser - Vie privée extrême"
+
+# Vérifier si Tor tourne déjà
+if ! ss -lpn 2>/dev/null | grep -q ':9050'; then
+    echo "🧅 Tor n'est pas actif. Lancement..."
+    tor &
+    # Attendre que Tor soit prêt
+    for i in {1..10}; do
+        if ss -lpn 2>/dev/null | grep -q ':9050'; then
+            echo "✅ Tor est prêt"
+            break
+        fi
+        sleep 1
+    done
+else
+    echo "✅ Tor est déjà actif"
+fi
+
+# Lancer le navigateur avec proxychains
+exec proxychains4 cargo run --release

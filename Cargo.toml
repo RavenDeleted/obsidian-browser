@@ -1,0 +1,20 @@
+[package]
+name = "obsidian-browser"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gtk4 = "0.9"
+glib = "0.20"
+webkit6 = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+url = "2"
+zeroize = "1"
+html5ever = "0.27"
+markup5ever_rcdom = "0.3"
+scraper = "0.20"
+async-channel = "2"
+dirs = "5"
+
+[build-dependencies]
+cc = "1"
