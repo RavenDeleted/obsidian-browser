@@ -23,6 +23,7 @@ use webkit6::{
     LoadEvent,
     WebView,
     PolicyDecisionType,
+    NetworkSession,
 };
 
 use url::Url;
@@ -32,9 +33,23 @@ use crate::network;
 use crate::parser;
 use crate::html;
 
-// ✅ Page d'accueil : Instance SearXNG priv.au
 const HOME: &str = "https://priv.au/";
 const INVIDIOUS_INSTANCE: &str = "invidious.nerdvpn.de";
+
+/// Détecte si une URL pointe vers un fichier qui doit être téléchargé.
+fn is_download_link(url: &str) -> bool {
+    let lower = url.to_lowercase();
+    let path = lower.split('?').next().unwrap_or(&lower);
+    let extensions = [
+        ".iso", ".img", ".zip", ".tar.gz", ".tgz", ".tar.xz", ".txz",
+        ".tar.bz2", ".tbz2", ".7z", ".rar", ".exe", ".msi", ".deb",
+        ".rpm", ".apk", ".pdf", ".doc", ".docx", ".xls", ".xlsx",
+        ".ppt", ".pptx", ".mp4", ".mkv", ".avi", ".mp3", ".flac",
+        ".bin", ".dmg", ".pkg", ".xz", ".gz", ".bz2", ".sha256",
+        ".sha512", ".asc", ".sig"
+    ];
+    extensions.iter().any(|ext| path.ends_with(ext))
+}
 
 fn configure_privacy_settings(settings: &webkit6::Settings) {
     settings.set_enable_page_cache(false);
@@ -43,8 +58,9 @@ fn configure_privacy_settings(settings: &webkit6::Settings) {
     settings.set_enable_webgl(false);
     settings.set_enable_media(false);
     settings.set_enable_webrtc(false);
+    
     settings.set_user_agent(Some(
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
     ));
 }
 
@@ -85,7 +101,66 @@ pub fn start() {
         .application_id("org.obsidian.browser")
         .build();
 
+    // 📥 Gestionnaire de téléchargements
+    if let Some(session) = NetworkSession::default() {
+        session.connect_download_started(move |_session, download| {
+            let download_dir = dirs::download_dir()
+                .unwrap_or_else(|| std::path::PathBuf::from("."));
+            
+            let mut filename = None;
+            
+            if let Some(request) = download.request() {
+                if let Some(uri_str) = request.uri() {
+                    if let Ok(parsed) = Url::parse(&uri_str) {
+                        if let Some(segments) = parsed.path_segments() {
+                            if let Some(last_segment) = segments.last() {
+                                if !last_segment.is_empty() {
+                                    filename = Some(last_segment.replace("%20", " "));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if filename.is_none() {
+                if let Some(response) = download.response() {
+                    if let Some(suggested) = response.suggested_filename() {
+                        filename = Some(suggested.to_string());
+                    }
+                }
+            }
+
+            let filename = filename.unwrap_or_else(|| "fichier_telecharge".to_string());
+            let file_path = download_dir.join(filename);
+            
+            if let Some(path_str) = file_path.to_str() {
+                download.set_destination(path_str);
+                println!("[download] 📥 Téléchargement vers : {}", path_str);
+            }
+        });
+    }
+
     app.connect_activate(|app| {
+        // 🌙 MODE SOMBRE
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(
+            "
+            window, .background { background-color: #1e1e1e; color: #ffffff; }
+            entry { background-color: #2d2d2d; color: #ffffff; border-radius: 6px; padding: 4px 8px; border: 1px solid #3c3c3c; }
+            button { background-color: #333333; color: #ffffff; border-radius: 6px; padding: 4px 10px; border: 1px solid #444444; }
+            button:hover { background-color: #444444; }
+            notebook header { background-color: #1e1e1e; border-bottom: 1px solid #333333; }
+            notebook tab { background-color: #2d2d2d; color: #aaaaaa; border-radius: 4px 4px 0 0; padding: 4px 8px; }
+            notebook tab:checked { background-color: #3c3c3c; color: #ffffff; }
+            ",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &gtk4::gdk::Display::default().unwrap(),
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+
         let window = ApplicationWindow::builder()
             .application(app)
             .title("Obsidian Browser 🔒")
@@ -148,8 +223,9 @@ pub fn start() {
                     configure_privacy_settings(&settings);
                 }
 
-                let privacy_policy = privacy_filter.clone();
+                let privacy_policy_nav = privacy_filter.clone();
                 webview.connect_decide_policy(move |_view, decision, decision_type| {
+                    // Navigation
                     if decision_type == PolicyDecisionType::NavigationAction {
                         if let Some(nav_decision) =
                             decision.downcast_ref::<webkit6::NavigationPolicyDecision>()
@@ -160,6 +236,15 @@ pub fn start() {
                                         let uri_str = uri.to_string();
                                         let uri_lower = uri_str.to_lowercase();
 
+                                        // Téléchargements
+                                        if is_download_link(&uri_str) {
+                                            println!("[download] 📥 Interception : {}", uri_str);
+                                            _view.download_uri(&uri_str);
+                                            decision.ignore();
+                                            return true;
+                                        }
+
+                                        // Redirection YouTube
                                         if uri_lower.contains("youtube.com") || uri_lower.contains("youtu.be") {
                                             let invidious_url = youtube_to_invidious(&uri_str);
                                             println!("[redirection] YouTube → Invidious : {}", invidious_url);
@@ -176,7 +261,8 @@ pub fn start() {
                                             return true;
                                         }
 
-                                        if privacy_policy.check(&uri_str) {
+                                        // Blocage privacy
+                                        if privacy_policy_nav.check(&uri_str) {
                                             println!("[privacy] 🚫 navigation bloquée : {}", uri_str);
                                             decision.ignore();
                                             return true;
@@ -186,6 +272,25 @@ pub fn start() {
                             }
                         }
                     }
+
+                    // Ressources
+                    if decision_type == PolicyDecisionType::Response {
+                        if let Some(response_decision) =
+                            decision.downcast_ref::<webkit6::ResponsePolicyDecision>()
+                        {
+                            if let Some(request) = response_decision.request() {
+                                if let Some(uri) = request.uri() {
+                                    let uri_str = uri.to_string();
+                                    if privacy_policy_nav.check(&uri_str) {
+                                        println!("[adblock] 🚫 ressource bloquée : {}", uri_str);
+                                        decision.ignore();
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
                     false
                 });
 
@@ -196,7 +301,9 @@ pub fn start() {
                 tab_box.append(&tab_label);
                 tab_box.append(&close_button);
 
+                // ✅ Remise du ScrolledWindow pour que l'affichage fonctionne
                 let scrolled = ScrolledWindow::new();
+                scrolled.set_policy(gtk4::PolicyType::Automatic, gtk4::PolicyType::Automatic);
                 scrolled.set_child(Some(&webview));
                 scrolled.set_vexpand(true);
                 scrolled.set_hexpand(true);
@@ -226,8 +333,6 @@ pub fn start() {
                             } else {
                                 *active_webview_clone.borrow_mut() = None;
                             }
-                        } else {
-                            println!("[browser] impossible de fermer le dernier onglet");
                         }
                     }
                 });
@@ -310,11 +415,10 @@ pub fn start() {
             }
         });
 
+        // Raccourcis
         let create_tab_fn_clone = create_tab_fn.clone();
         let action_new_tab = gtk4::gio::SimpleAction::new("new-tab", None);
-        action_new_tab.connect_activate(move |_, _| {
-            create_tab_fn_clone();
-        });
+        action_new_tab.connect_activate(move |_, _| { create_tab_fn_clone(); });
         window.add_action(&action_new_tab);
 
         let notebook_clone = notebook.clone();
@@ -365,9 +469,7 @@ pub fn start() {
 
         let app_clone = app.clone();
         let action_quit = gtk4::gio::SimpleAction::new("quit", None);
-        action_quit.connect_activate(move |_, _| {
-            app_clone.quit();
-        });
+        action_quit.connect_activate(move |_, _| { app_clone.quit(); });
         window.add_action(&action_quit);
 
         app.set_accels_for_action("win.new-tab", &["<Ctrl>T"]);
@@ -378,9 +480,7 @@ pub fn start() {
         app.set_accels_for_action("win.quit", &["<Ctrl>Q"]);
 
         let create_tab_fn_clone = create_tab_fn.clone();
-        new_tab.connect_clicked(move |_| {
-            create_tab_fn_clone();
-        });
+        new_tab.connect_clicked(move |_| { create_tab_fn_clone(); });
 
         back.connect_clicked({
             let get = get_active_webview.clone();
@@ -421,16 +521,9 @@ pub fn start() {
                     if let Some(uri) = webview.uri() {
                         let uri_str = uri.to_string();
                         let mut file = OpenOptions::new()
-                            .create(true)
-                            .append(true)
+                            .create(true).append(true)
                             .open("favorites.txt")
-                            .unwrap_or_else(|_| {
-                                OpenOptions::new()
-                                    .create(true)
-                                    .write(true)
-                                    .open("favorites.txt")
-                                    .unwrap()
-                            });
+                            .unwrap_or_else(|_| OpenOptions::new().create(true).write(true).open("favorites.txt").unwrap());
                         writeln!(file, "{}", uri_str).unwrap();
                         println!("[favori] ⭐ ajouté : {}", uri_str);
                     }
@@ -457,7 +550,6 @@ pub fn start() {
                 if let Some(webview) = get() {
                     if let Some(uri) = webview.uri() {
                         let url = uri.to_string();
-                        println!("[reader] 📖 Chargement de {}", url);
                         *loading.borrow_mut() = true;
 
                         match network::fetch_url(&url) {
@@ -480,29 +572,24 @@ pub fn start() {
                                         <meta charset="utf-8">
                                         <title>{}</title>
                                         <style>
-                                            body {{ background: #f9f9f9; color: #222; font-family: Georgia, serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }}
-                                            h1 {{ font-size: 2em; border-bottom: 1px solid #ccc; }}
+                                            body {{ background: #121212; color: #dddddd; font-family: Georgia, serif; max-width: 800px; margin: 40px auto; padding: 20px; line-height: 1.6; }}
+                                            h1 {{ font-size: 2em; border-bottom: 1px solid #333; color: #fff; }}
                                             pre {{ white-space: pre-wrap; font-family: Georgia, serif; font-size: 1.1em; }}
-                                            .meta {{ color: #666; font-size: 0.9em; font-family: sans-serif; }}
+                                            .meta {{ color: #888; font-size: 0.9em; font-family: sans-serif; }}
+                                            a {{ color: #66b3ff; }}
                                         </style>
                                     </head>
                                     <body>
                                         <h1>{}</h1>
-                                        <p class="meta">
-                                            <strong>Analyse Obsidian :</strong> {} liens détectés | {} caractères de texte extraits
-                                        </p>
-                                        <hr>
+                                        <p class="meta"><strong>Analyse Obsidian :</strong> {} liens détectés | {} caractères de texte extraits</p>
+                                        <hr style="border-color: #333;">
                                         <pre>{}</pre>
-                                        <hr>
+                                        <hr style="border-color: #333;">
                                         <p class="meta">Mode lecture - Obsidian Browser</p>
                                     </body>
                                     </html>
                                     "#,
-                                    parsed.title,
-                                    parsed.title,
-                                    parsed.links.len(),
-                                    parsed.text.len(),
-                                    clean
+                                    parsed.title, parsed.title, parsed.links.len(), parsed.text.len(), clean
                                 );
 
                                 reader_view.load_html(&content, Some(&url));
@@ -530,7 +617,6 @@ pub fn start() {
                                 });
 
                                 *loading.borrow_mut() = false;
-                                println!("[reader] ✅ Affichage du mode lecture");
                             }
                             Err(e) => {
                                 println!("[reader] ❌ Erreur : {}", e);
@@ -560,7 +646,6 @@ pub fn start() {
 
             move || {
                 if *loading.borrow() { return; }
-
                 let mut url = entry.text().to_string();
                 if url.is_empty() { return; }
 
@@ -571,7 +656,6 @@ pub fn start() {
 
                 if !url.starts_with("http://") && !url.starts_with("https://") {
                     if url.contains(' ') || !url.contains('.') {
-                        // ✅ Recherche avec l'instance SearXNG priv.au
                         url = format!("https://priv.au/search?q={}", url.replace(' ', "+"));
                     } else {
                         url = format!("https://{}", url);
